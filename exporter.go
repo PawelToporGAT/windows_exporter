@@ -3,13 +3,11 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +15,11 @@ import (
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/StackExchange/wmi"
+	"github.com/jasonlvhit/gocron"
 	"github.com/prometheus-community/windows_exporter/collector"
 	"github.com/prometheus-community/windows_exporter/config"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/push"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -343,55 +342,55 @@ func main() {
 
 	log.Infof("Enabled collectors: %v", strings.Join(keys(collectors), ", "))
 
-	h := &metricsHandler{
-		timeoutMargin: *timeoutMargin,
-		collectorFactory: func(timeout time.Duration, requestedCollectors []string) (error, *windowsCollector) {
-			filteredCollectors := make(map[string]collector.Collector)
-			// scrape all enabled collectors if no collector is requested
-			if len(requestedCollectors) == 0 {
-				filteredCollectors = collectors
-			}
-			for _, name := range requestedCollectors {
-				col, exists := collectors[name]
-				if !exists {
-					return fmt.Errorf("unavailable collector: %s", name), nil
-				}
-				filteredCollectors[name] = col
-			}
-			return nil, &windowsCollector{
-				collectors:        filteredCollectors,
-				maxScrapeDuration: timeout,
-			}
-		},
-	}
-
-	http.HandleFunc(*metricsPath, withConcurrencyLimit(*maxRequests, h.ServeHTTP))
-	http.HandleFunc("/health", healthCheck)
-	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		// we can't use "version" directly as it is a package, and not an object that
-		// can be serialized.
-		err := json.NewEncoder(w).Encode(prometheusVersion{
-			Version:   version.Version,
-			Revision:  version.Revision,
-			Branch:    version.Branch,
-			BuildUser: version.BuildUser,
-			BuildDate: version.BuildDate,
-			GoVersion: version.GoVersion,
-		})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error encoding JSON: %s", err), http.StatusInternalServerError)
-		}
-	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`<html>
-<head><title>windows_exporter</title></head>
-<body>
-<h1>windows_exporter</h1>
-<p><a href="` + *metricsPath + `">Metrics</a></p>
-<p><i>` + version.Info() + `</i></p>
-</body>
-</html>`))
-	})
+	// h := &metricsHandler{
+	// 	timeoutMargin: *timeoutMargin,
+	// 	collectorFactory: func(timeout time.Duration, requestedCollectors []string) (error, *windowsCollector) {
+	// 		filteredCollectors := make(map[string]collector.Collector)
+	// 		// scrape all enabled collectors if no collector is requested
+	// 		if len(requestedCollectors) == 0 {
+	// 			filteredCollectors = collectors
+	// 		}
+	// 		for _, name := range requestedCollectors {
+	// 			col, exists := collectors[name]
+	// 			if !exists {
+	// 				return fmt.Errorf("unavailable collector: %s", name), nil
+	// 			}
+	// 			filteredCollectors[name] = col
+	// 		}
+	// 		return nil, &windowsCollector{
+	// 			collectors:        filteredCollectors,
+	// 			maxScrapeDuration: timeout,
+	// 		}
+	// 	},
+	// }
+	go executePushMetrics()
+	// 	http.HandleFunc(*metricsPath, withConcurrencyLimit(*maxRequests, h.ServeHTTP))
+	// 	http.HandleFunc("/health", healthCheck)
+	// 	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+	// 		// we can't use "version" directly as it is a package, and not an object that
+	// 		// can be serialized.
+	// 		err := json.NewEncoder(w).Encode(prometheusVersion{
+	// 			Version:   version.Version,
+	// 			Revision:  version.Revision,
+	// 			Branch:    version.Branch,
+	// 			BuildUser: version.BuildUser,
+	// 			BuildDate: version.BuildDate,
+	// 			GoVersion: version.GoVersion,
+	// 		})
+	// 		if err != nil {
+	// 			http.Error(w, fmt.Sprintf("error encoding JSON: %s", err), http.StatusInternalServerError)
+	// 		}
+	// 	})
+	// 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// 		_, _ = w.Write([]byte(`<html>
+	// <head><title>windows_exporter</title></head>
+	// <body>
+	// <h1>windows_exporter</h1>
+	// <p><a href="` + *metricsPath + `">Metrics</a></p>
+	// <p><i>` + version.Info() + `</i></p>
+	// </body>
+	// </html>`))
+	// 	})
 
 	log.Infoln("Starting windows_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
@@ -409,13 +408,13 @@ func main() {
 	}
 }
 
-func healthCheck(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, err := fmt.Fprintln(w, `{"status":"ok"}`)
-	if err != nil {
-		log.Debugf("Failed to write to stream: %v", err)
-	}
-}
+// func healthCheck(w http.ResponseWriter, r *http.Request) {
+// 	w.Header().Set("Content-Type", "application/json")
+// 	_, err := fmt.Fprintln(w, `{"status":"ok"}`)
+// 	if err != nil {
+// 		log.Debugf("Failed to write to stream: %v", err)
+// 	}
+// }
 
 func keys(m map[string]collector.Collector) []string {
 	ret := make([]string, 0, len(m))
@@ -425,24 +424,24 @@ func keys(m map[string]collector.Collector) []string {
 	return ret
 }
 
-func withConcurrencyLimit(n int, next http.HandlerFunc) http.HandlerFunc {
-	if n <= 0 {
-		return next
-	}
+// func withConcurrencyLimit(n int, next http.HandlerFunc) http.HandlerFunc {
+// 	if n <= 0 {
+// 		return next
+// 	}
 
-	sem := make(chan struct{}, n)
-	return func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case sem <- struct{}{}:
-			defer func() { <-sem }()
-		default:
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("Too many concurrent requests"))
-			return
-		}
-		next(w, r)
-	}
-}
+// 	sem := make(chan struct{}, n)
+// 	return func(w http.ResponseWriter, r *http.Request) {
+// 		select {
+// 		case sem <- struct{}{}:
+// 			defer func() { <-sem }()
+// 		default:
+// 			w.WriteHeader(http.StatusServiceUnavailable)
+// 			_, _ = w.Write([]byte("Too many concurrent requests"))
+// 			return
+// 		}
+// 		next(w, r)
+// 	}
+// }
 
 type windowsExporterService struct {
 	stopCh chan<- bool
@@ -471,42 +470,58 @@ loop:
 	return
 }
 
-type metricsHandler struct {
-	timeoutMargin    float64
-	collectorFactory func(timeout time.Duration, requestedCollectors []string) (error, *windowsCollector)
-}
+// type metricsHandler struct {
+// 	timeoutMargin    float64
+// 	collectorFactory func(timeout time.Duration, requestedCollectors []string) (error, *windowsCollector)
+// }
 
-func (mh *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	const defaultTimeout = 10.0
+// func (mh *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// 	const defaultTimeout = 10.0
 
-	var timeoutSeconds float64
-	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
-		var err error
-		timeoutSeconds, err = strconv.ParseFloat(v, 64)
-		if err != nil {
-			log.Warnf("Couldn't parse X-Prometheus-Scrape-Timeout-Seconds: %q. Defaulting timeout to %f", v, defaultTimeout)
-		}
-	}
-	if timeoutSeconds == 0 {
-		timeoutSeconds = defaultTimeout
-	}
-	timeoutSeconds = timeoutSeconds - mh.timeoutMargin
+// 	var timeoutSeconds float64
+// 	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+// 		var err error
+// 		timeoutSeconds, err = strconv.ParseFloat(v, 64)
+// 		if err != nil {
+// 			log.Warnf("Couldn't parse X-Prometheus-Scrape-Timeout-Seconds: %q. Defaulting timeout to %f", v, defaultTimeout)
+// 		}
+// 	}
+// 	if timeoutSeconds == 0 {
+// 		timeoutSeconds = defaultTimeout
+// 	}
+// 	timeoutSeconds = timeoutSeconds - mh.timeoutMargin
 
+// 	reg := prometheus.NewRegistry()
+// 	err, wc := mh.collectorFactory(time.Duration(timeoutSeconds*float64(time.Second)), r.URL.Query()["collect[]"])
+// 	if err != nil {
+// 		log.Warnln("Couldn't create filtered metrics handler: ", err)
+// 		w.WriteHeader(http.StatusBadRequest)
+// 		w.Write([]byte(fmt.Sprintf("Couldn't create filtered metrics handler: %s", err)))
+// 		return
+// 	}
+// 	reg.MustRegister(wc)
+// 	reg.MustRegister(
+// 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+// 		prometheus.NewGoCollector(),
+// 		version.NewCollector("windows_exporter"),
+// 	)
+
+// 	h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+// 	h.ServeHTTP(w, r)
+// }
+func pushMetrics() {
 	reg := prometheus.NewRegistry()
-	err, wc := mh.collectorFactory(time.Duration(timeoutSeconds*float64(time.Second)), r.URL.Query()["collect[]"])
-	if err != nil {
-		log.Warnln("Couldn't create filtered metrics handler: ", err)
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(fmt.Sprintf("Couldn't create filtered metrics handler: %s", err)))
-		return
-	}
-	reg.MustRegister(wc)
+	// err, wc := mh.collectorFactory(time.Duration(timeoutSeconds*float64(time.Second)), r.URL.Query()["collect[]"])
+	// reg.MustRegister(wc)
 	reg.MustRegister(
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 		prometheus.NewGoCollector(),
 		version.NewCollector("windows_exporter"),
 	)
+	push.New("http://dev-prometheus-push-gw.gatserver.com/metrics", "my_job").Gatherer(myRegistry).Push()
+}
+func executePushMetrics() {
 
-	h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	gocron.Every(30).Second().Do(pushMetrics)
+	<-gocron.Start()
 }
